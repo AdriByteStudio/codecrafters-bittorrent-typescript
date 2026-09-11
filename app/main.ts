@@ -461,4 +461,13 @@ if (args[2] === "decode") {
 
     fs.writeFileSync(outputPath, fileData);
     console.log(`Downloaded ${torrentPath} to ${outputPath}`);
+} else if (args[2] === "magnet_parse") {
+    const magnetLink = args[3];
+    const query = magnetLink.split("?")[1];
+    const params = new URLSearchParams(query);
+    const xt = params.get("xt") ?? "";
+    const tr = params.get("tr") ?? "";
+    const infoHash = xt.replace("urn:btih:", "");
+    console.log(`Tracker URL: ${tr}`);
+    console.log(`Info Hash: ${infoHash}`);
 }
