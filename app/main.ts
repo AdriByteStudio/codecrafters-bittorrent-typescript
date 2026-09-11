@@ -585,7 +585,11 @@ if (args[2] === "decode") {
         extHandshake[5] = 0; // extension handshake id
         payload.copy(extHandshake, 6);
         socket.write(extHandshake);
+
+        // Give the message time to flush before closing
+        await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
-    socket.end();
+    socket.destroy();
+    process.exit(0);
 }
