@@ -1,27 +1,44 @@
-// Examples:
-// - decodeBencode("5:hello") -> "hello"
-// - decodeBencode("10:hello12345") -> "hello12345"
-// - decodeBencode("i52e") -> 52
-// - decodeBencode("i-52e") -> -52
-function decodeBencode(bencodedValue: string): string | number {
-    // Check if the first character is a digit (bencoded string)
-    if (!isNaN(parseInt(bencodedValue[0]))) {
-        const firstColonIndex = bencodedValue.indexOf(":");
-        if (firstColonIndex === -1) {
-            throw new Error("Invalid encoded value");
+type BencodeValue = string | number | BencodeValue[];
+
+// Decodes a single bencoded value starting at cursor.pos, advancing the cursor past it.
+function decodeBencodeAt(bencodedValue: string, cursor: { pos: number }): BencodeValue {
+    const firstChar = bencodedValue[cursor.pos];
+
+    if (!isNaN(parseInt(firstChar))) {
+        // Bencoded string: <length>:<string>
+        const colonIndex = bencodedValue.indexOf(":", cursor.pos);
+        if (colonIndex === -1) {
+            throw new Error("Invalid bencoded string");
         }
-        return bencodedValue.substring(firstColonIndex + 1);
-    } else if (bencodedValue[0] === "i") {
+        const length = parseInt(bencodedValue.substring(cursor.pos, colonIndex), 10);
+        const start = colonIndex + 1;
+        cursor.pos = start + length;
+        return bencodedValue.substring(start, cursor.pos);
+    } else if (firstChar === "i") {
         // Bencoded integer: i<number>e
-        const endIndex = bencodedValue.indexOf("e", 1);
+        const endIndex = bencodedValue.indexOf("e", cursor.pos + 1);
         if (endIndex === -1) {
             throw new Error("Invalid bencoded integer");
         }
-        const integerStr = bencodedValue.substring(1, endIndex);
+        const integerStr = bencodedValue.substring(cursor.pos + 1, endIndex);
+        cursor.pos = endIndex + 1;
         return parseInt(integerStr, 10);
+    } else if (firstChar === "l") {
+        // Bencoded list: l<bencoded_elements>e
+        cursor.pos++; // skip 'l'
+        const list: BencodeValue[] = [];
+        while (bencodedValue[cursor.pos] !== "e") {
+            list.push(decodeBencodeAt(bencodedValue, cursor));
+        }
+        cursor.pos++; // skip 'e'
+        return list;
     } else {
-        throw new Error("Only strings and integers are supported at the moment");
+        throw new Error(`Invalid bencoded value: unexpected character '${firstChar}'`);
     }
+}
+
+function decodeBencode(bencodedValue: string): BencodeValue {
+    return decodeBencodeAt(bencodedValue, { pos: 0 });
 }
 
 const args = process.argv;
