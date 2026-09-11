@@ -142,19 +142,31 @@ function parsePeers(peersRaw: Buffer): string[] {
     return peers;
 }
 
-async function getPeersFromTracker(torrent: TorrentInfo): Promise<string[]> {
+function buildHandshake(infoHashRaw: Buffer, peerId: Buffer, extensions = false): Buffer {
+    const handshake = Buffer.alloc(68);
+    handshake[0] = 19; // protocol string length
+    handshake.write("BitTorrent protocol", 1); // protocol string (19 bytes)
+    if (extensions) {
+        handshake[25] = 0x10; // set 20th bit from right (extension protocol support)
+    }
+    infoHashRaw.copy(handshake, 28); // info hash (20 bytes)
+    peerId.copy(handshake, 48); // peer id (20 bytes)
+    return handshake;
+}
+
+async function getPeersFromTracker(announce: string, infoHashRaw: Buffer, length = 0): Promise<string[]> {
     const peerId = "-TS0001-123456789012";
 
     const queryParams = [
-        `info_hash=${percentEncode(torrent.infoHashRaw)}`,
+        `info_hash=${percentEncode(infoHashRaw)}`,
         `peer_id=${encodeURIComponent(peerId)}`,
         "port=6881",
         "uploaded=0",
         "downloaded=0",
-        `left=${torrent.length}`,
+        `left=${length}`,
         "compact=1",
     ];
-    const trackerUrl = `${torrent.announce}?${queryParams.join("&")}`;
+    const trackerUrl = `${announce}?${queryParams.join("&")}`;
 
     const response = await fetch(trackerUrl);
     const responseBody = Buffer.from(await response.arrayBuffer());
@@ -183,11 +195,7 @@ async function downloadPieceFromPeer(
     pieceIndex: number
 ): Promise<Buffer> {
     const peerId = randomBytes(20);
-    const handshake = Buffer.alloc(68);
-    handshake[0] = 19; // protocol string length
-    handshake.write("BitTorrent protocol", 1); // protocol string (19 bytes)
-    torrent.infoHashRaw.copy(handshake, 28); // info hash (20 bytes)
-    peerId.copy(handshake, 48); // peer id (20 bytes)
+    const handshake = buildHandshake(torrent.infoHashRaw, peerId);
 
     const socket = net.createConnection(peerPort, peerHost);
 
@@ -346,7 +354,7 @@ if (args[2] === "decode") {
     }
 } else if (args[2] === "peers") {
     const torrent = parseTorrent(args[3]);
-    const peers = await getPeersFromTracker(torrent);
+    const peers = await getPeersFromTracker(torrent.announce, torrent.infoHashRaw, torrent.length);
     for (const peer of peers) {
         console.log(peer);
     }
@@ -355,16 +363,10 @@ if (args[2] === "decode") {
     const [peerHost, peerPortStr] = args[4].split(":");
     const peerPort = parseInt(peerPortStr, 10);
     const peerId = randomBytes(20);
-
-    // Build handshake: 1 + 19 + 8 + 20 + 20 = 68 bytes
-    const handshake = Buffer.alloc(68);
-    handshake[0] = 19; // protocol string length
-    handshake.write("BitTorrent protocol", 1); // protocol string (19 bytes)
-    // reserved bytes: 8 bytes of zeros (already zero from alloc)
-    torrent.infoHashRaw.copy(handshake, 28); // info hash (20 bytes)
-    peerId.copy(handshake, 48); // peer id (20 bytes)
+    const handshake = buildHandshake(torrent.infoHashRaw, peerId);
 
     const socket = net.createConnection(peerPort, peerHost);
+    let received = Buffer.alloc(0);
 
     await new Promise<void>((resolve, reject) => {
         socket.on("connect", () => {
@@ -372,13 +374,14 @@ if (args[2] === "decode") {
         });
 
         socket.on("data", (data: Buffer) => {
+            received = Buffer.concat([received, data]);
             // The response handshake is 68 bytes
-            if (data.length >= 68) {
-                const receivedPeerId = data.subarray(48, 68);
+            if (received.length >= 68) {
+                const receivedPeerId = received.subarray(48, 68);
                 console.log(`Peer ID: ${receivedPeerId.toString("hex")}`);
+                socket.end();
+                resolve();
             }
-            socket.end();
-            resolve();
         });
 
         socket.on("error", (err) => {
@@ -391,7 +394,7 @@ if (args[2] === "decode") {
     const pieceIndex = parseInt(args[6], 10);
 
     const torrent = parseTorrent(torrentPath);
-    const peers = await getPeersFromTracker(torrent);
+    const peers = await getPeersFromTracker(torrent.announce, torrent.infoHashRaw, torrent.length);
 
     let pieceData: Buffer | null = null;
     for (const peer of peers) {
@@ -425,7 +428,7 @@ if (args[2] === "decode") {
     const torrentPath = args[5];
 
     const torrent = parseTorrent(torrentPath);
-    const peers = await getPeersFromTracker(torrent);
+    const peers = await getPeersFromTracker(torrent.announce, torrent.infoHashRaw, torrent.length);
 
     const numPieces = Math.ceil(torrent.length / torrent.pieceLength);
     const fileData = Buffer.alloc(torrent.length);
@@ -470,4 +473,36 @@ if (args[2] === "decode") {
     const infoHash = xt.replace("urn:btih:", "");
     console.log(`Tracker URL: ${tr}`);
     console.log(`Info Hash: ${infoHash}`);
+} else if (args[2] === "magnet_handshake") {
+    const magnetLink = args[3];
+    const query = magnetLink.split("?")[1];
+    const params = new URLSearchParams(query);
+    const xt = params.get("xt") ?? "";
+    const trackerUrl = params.get("tr") ?? "";
+    const infoHashRaw = Buffer.from(xt.replace("urn:btih:", ""), "hex");
+    const peerId = randomBytes(20);
+
+    const peers = await getPeersFromTracker(trackerUrl, infoHashRaw, 1);
+    const [peerHost, peerPortStr] = peers[0].split(":");
+    const peerPort = parseInt(peerPortStr, 10);
+
+    const handshake = buildHandshake(infoHashRaw, peerId, true);
+
+    const socket = net.createConnection(peerPort, peerHost);
+    let received = Buffer.alloc(0);
+    await new Promise<void>((resolve, reject) => {
+        socket.on("connect", () => {
+            socket.write(handshake);
+        });
+        socket.on("data", (data: Buffer) => {
+            received = Buffer.concat([received, data]);
+            if (received.length >= 68) {
+                const receivedPeerId = received.subarray(48, 68);
+                console.log(`Peer ID: ${receivedPeerId.toString("hex")}`);
+                socket.end();
+                resolve();
+            }
+        });
+        socket.on("error", reject);
+    });
 }
