@@ -1,4 +1,4 @@
-type BencodeValue = string | number | BencodeValue[];
+type BencodeValue = string | number | BencodeValue[] | { [key: string]: BencodeValue };
 
 // Decodes a single bencoded value starting at cursor.pos, advancing the cursor past it.
 function decodeBencodeAt(bencodedValue: string, cursor: { pos: number }): BencodeValue {
@@ -32,6 +32,20 @@ function decodeBencodeAt(bencodedValue: string, cursor: { pos: number }): Bencod
         }
         cursor.pos++; // skip 'e'
         return list;
+    } else if (firstChar === "d") {
+        // Bencoded dictionary: d<key1><value1>...<keyN><valueN>e
+        cursor.pos++; // skip 'd'
+        const dict: { [key: string]: BencodeValue } = {};
+        while (bencodedValue[cursor.pos] !== "e") {
+            const key = decodeBencodeAt(bencodedValue, cursor);
+            if (typeof key !== "string") {
+                throw new Error("Dictionary keys must be strings");
+            }
+            const value = decodeBencodeAt(bencodedValue, cursor);
+            dict[key] = value;
+        }
+        cursor.pos++; // skip 'e'
+        return dict;
     } else {
         throw new Error(`Invalid bencoded value: unexpected character '${firstChar}'`);
     }
