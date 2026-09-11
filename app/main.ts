@@ -142,32 +142,7 @@ function parsePeers(peersRaw: Buffer): string[] {
     return peers;
 }
 
-const args = process.argv;
-
-if (args[2] === "decode") {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    console.error("Logs from your program will appear here!");
-
-    try {
-        const decoded = decodeBencode(Buffer.from(args[3], "utf8"));
-        console.log(JSON.stringify(decoded));
-    } catch (error) {
-        console.error(error.message);
-    }
-} else if (args[2] === "info") {
-    const torrent = parseTorrent(args[3]);
-    console.log(`Tracker URL: ${torrent.announce}`);
-    console.log(`Length: ${torrent.length}`);
-    console.log(`Info Hash: ${torrent.infoHashRaw.toString("hex")}`);
-    console.log(`Piece Length: ${torrent.pieceLength}`);
-    console.log("Piece Hashes:");
-    if (torrent.piecesRaw) {
-        for (let i = 0; i < torrent.piecesRaw.length; i += 20) {
-            console.log(torrent.piecesRaw.subarray(i, i + 20).toString("hex"));
-        }
-    }
-} else if (args[2] === "peers") {
-    const torrent = parseTorrent(args[3]);
+async function getPeersFromTracker(torrent: TorrentInfo): Promise<string[]> {
     const peerId = "-TS0001-123456789012";
 
     const queryParams = [
@@ -198,10 +173,182 @@ if (args[2] === "decode") {
         }
     }
 
-    if (peersRaw) {
-        for (const peer of parsePeers(peersRaw)) {
-            console.log(peer);
+    return peersRaw ? parsePeers(peersRaw) : [];
+}
+
+async function downloadPieceFromPeer(
+    torrent: TorrentInfo,
+    peerHost: string,
+    peerPort: number,
+    pieceIndex: number
+): Promise<Buffer> {
+    const peerId = randomBytes(20);
+    const handshake = Buffer.alloc(68);
+    handshake[0] = 19; // protocol string length
+    handshake.write("BitTorrent protocol", 1); // protocol string (19 bytes)
+    torrent.infoHashRaw.copy(handshake, 28); // info hash (20 bytes)
+    peerId.copy(handshake, 48); // peer id (20 bytes)
+
+    const socket = net.createConnection(peerPort, peerHost);
+
+    // Message queue for parsed peer messages
+    const messageQueue: Buffer[] = [];
+    let waiters: { resolve: (msg: Buffer) => void; reject: (err: Error) => void }[] = [];
+
+    const pushMessage = (msg: Buffer) => {
+        if (waiters.length > 0) {
+            waiters.shift()!.resolve(msg);
+        } else {
+            messageQueue.push(msg);
         }
+    };
+
+    const nextMessage = (): Promise<Buffer> => {
+        if (messageQueue.length > 0) {
+            return Promise.resolve(messageQueue.shift()!);
+        }
+        return new Promise((resolve, reject) => {
+            waiters.push({ resolve, reject });
+        });
+    };
+
+    // Accumulate raw socket data
+    let buffer = Buffer.alloc(0);
+    let handshakeReceived = false;
+    let resolveHandshake: () => void;
+    const handshakePromise = new Promise<void>((resolve) => {
+        resolveHandshake = resolve;
+    });
+
+    socket.on("data", (data: Buffer) => {
+        buffer = Buffer.concat([buffer, data]);
+
+        if (!handshakeReceived) {
+            if (buffer.length < 68) {
+                return;
+            }
+            buffer = buffer.subarray(68);
+            handshakeReceived = true;
+            resolveHandshake();
+        }
+
+        // Parse complete peer messages
+        while (buffer.length >= 4) {
+            const length = buffer.readUInt32BE(0);
+            if (length === 0) {
+                buffer = buffer.subarray(4); // keep-alive
+                continue;
+            }
+            if (buffer.length < 4 + length) {
+                break; // incomplete message
+            }
+            const message = buffer.subarray(4, 4 + length);
+            buffer = buffer.subarray(4 + length);
+            pushMessage(message);
+        }
+    });
+
+    socket.on("error", (err) => {
+        while (waiters.length > 0) {
+            waiters.shift()!.reject(err);
+        }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+    });
+
+    socket.write(handshake);
+    await handshakePromise;
+
+    // Wait for bitfield message (id 5)
+    let msg = await nextMessage();
+    while (msg[0] !== 5) {
+        msg = await nextMessage();
+    }
+
+    // Send interested (id 2)
+    const interested = Buffer.alloc(5);
+    interested.writeUInt32BE(1, 0);
+    interested[4] = 2;
+    socket.write(interested);
+
+    // Wait for unchoke (id 1)
+    msg = await nextMessage();
+    while (msg[0] !== 1) {
+        msg = await nextMessage();
+    }
+
+    // Compute this piece's length (last piece may be shorter)
+    const numPieces = Math.ceil(torrent.length / torrent.pieceLength);
+    const thisPieceLength =
+        pieceIndex === numPieces - 1
+            ? torrent.length - (numPieces - 1) * torrent.pieceLength
+            : torrent.pieceLength;
+
+    const blockSize = 16 * 1024; // 16 KiB
+    const numBlocks = Math.ceil(thisPieceLength / blockSize);
+    const pieceData = Buffer.alloc(thisPieceLength);
+    let blocksReceived = 0;
+
+    // Send requests for all blocks (pipelined)
+    for (let begin = 0; begin < thisPieceLength; begin += blockSize) {
+        const blockLength = Math.min(blockSize, thisPieceLength - begin);
+        const request = Buffer.alloc(17);
+        request.writeUInt32BE(13, 0); // message length
+        request[4] = 6; // request id
+        request.writeUInt32BE(pieceIndex, 5); // index
+        request.writeUInt32BE(begin, 9); // begin
+        request.writeUInt32BE(blockLength, 13); // length
+        socket.write(request);
+    }
+
+    // Wait for piece messages (id 7)
+    while (blocksReceived < numBlocks) {
+        msg = await nextMessage();
+        if (msg[0] !== 7) {
+            continue;
+        }
+        const begin = msg.readUInt32BE(5);
+        const block = msg.subarray(9);
+        block.copy(pieceData, begin);
+        blocksReceived++;
+    }
+
+    socket.end();
+    return pieceData;
+}
+
+const args = process.argv;
+
+if (args[2] === "decode") {
+    // You can use print statements as follows for debugging, they'll be visible when running tests.
+    console.error("Logs from your program will appear here!");
+
+    try {
+        const decoded = decodeBencode(Buffer.from(args[3], "utf8"));
+        console.log(JSON.stringify(decoded));
+    } catch (error) {
+        console.error(error.message);
+    }
+} else if (args[2] === "info") {
+    const torrent = parseTorrent(args[3]);
+    console.log(`Tracker URL: ${torrent.announce}`);
+    console.log(`Length: ${torrent.length}`);
+    console.log(`Info Hash: ${torrent.infoHashRaw.toString("hex")}`);
+    console.log(`Piece Length: ${torrent.pieceLength}`);
+    console.log("Piece Hashes:");
+    if (torrent.piecesRaw) {
+        for (let i = 0; i < torrent.piecesRaw.length; i += 20) {
+            console.log(torrent.piecesRaw.subarray(i, i + 20).toString("hex"));
+        }
+    }
+} else if (args[2] === "peers") {
+    const torrent = parseTorrent(args[3]);
+    const peers = await getPeersFromTracker(torrent);
+    for (const peer of peers) {
+        console.log(peer);
     }
 } else if (args[2] === "handshake") {
     const torrent = parseTorrent(args[3]);
@@ -238,4 +385,39 @@ if (args[2] === "decode") {
             reject(err);
         });
     });
+} else if (args[2] === "download_piece") {
+    const outputPath = args[4];
+    const torrentPath = args[5];
+    const pieceIndex = parseInt(args[6], 10);
+
+    const torrent = parseTorrent(torrentPath);
+    const peers = await getPeersFromTracker(torrent);
+
+    let pieceData: Buffer | null = null;
+    for (const peer of peers) {
+        const [peerHost, peerPortStr] = peer.split(":");
+        const peerPort = parseInt(peerPortStr, 10);
+        try {
+            pieceData = await downloadPieceFromPeer(torrent, peerHost, peerPort, pieceIndex);
+            break;
+        } catch (err) {
+            // Try the next peer
+        }
+    }
+
+    if (!pieceData) {
+        throw new Error("Failed to download piece from any peer");
+    }
+
+    // Verify the piece hash against the torrent file
+    if (torrent.piecesRaw) {
+        const expectedHash = torrent.piecesRaw.subarray(pieceIndex * 20, (pieceIndex + 1) * 20);
+        const actualHash = createHash("sha1").update(pieceData).digest();
+        if (!actualHash.equals(expectedHash)) {
+            throw new Error("Piece hash mismatch");
+        }
+    }
+
+    fs.writeFileSync(outputPath, pieceData);
+    console.log(`Piece ${pieceIndex} downloaded to ${outputPath}`);
 }
