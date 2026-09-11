@@ -489,20 +489,103 @@ if (args[2] === "decode") {
     const handshake = buildHandshake(infoHashRaw, peerId, true);
 
     const socket = net.createConnection(peerPort, peerHost);
-    let received = Buffer.alloc(0);
-    await new Promise<void>((resolve, reject) => {
-        socket.on("connect", () => {
-            socket.write(handshake);
+
+    // Message queue for parsed peer messages
+    const messageQueue: Buffer[] = [];
+    let waiters: { resolve: (msg: Buffer) => void; reject: (err: Error) => void }[] = [];
+
+    const pushMessage = (msg: Buffer) => {
+        if (waiters.length > 0) {
+            waiters.shift()!.resolve(msg);
+        } else {
+            messageQueue.push(msg);
+        }
+    };
+
+    const nextMessage = (): Promise<Buffer> => {
+        if (messageQueue.length > 0) {
+            return Promise.resolve(messageQueue.shift()!);
+        }
+        return new Promise((resolve, reject) => {
+            waiters.push({ resolve, reject });
         });
-        socket.on("data", (data: Buffer) => {
-            received = Buffer.concat([received, data]);
-            if (received.length >= 68) {
-                const receivedPeerId = received.subarray(48, 68);
-                console.log(`Peer ID: ${receivedPeerId.toString("hex")}`);
-                socket.end();
-                resolve();
-            }
-        });
-        socket.on("error", reject);
+    };
+
+    let buffer = Buffer.alloc(0);
+    let handshakeReceived = false;
+    let receivedHandshake: Buffer | null = null;
+    let resolveHandshake: () => void;
+    const handshakePromise = new Promise<void>((resolve) => {
+        resolveHandshake = resolve;
     });
+
+    socket.on("data", (data: Buffer) => {
+        buffer = Buffer.concat([buffer, data]);
+
+        if (!handshakeReceived) {
+            if (buffer.length < 68) {
+                return;
+            }
+            receivedHandshake = buffer.subarray(0, 68);
+            buffer = buffer.subarray(68);
+            handshakeReceived = true;
+            resolveHandshake();
+        }
+
+        // Parse complete peer messages
+        while (buffer.length >= 4) {
+            const length = buffer.readUInt32BE(0);
+            if (length === 0) {
+                buffer = buffer.subarray(4); // keep-alive
+                continue;
+            }
+            if (buffer.length < 4 + length) {
+                break; // incomplete message
+            }
+            const message = buffer.subarray(4, 4 + length);
+            buffer = buffer.subarray(4 + length);
+            pushMessage(message);
+        }
+    });
+
+    socket.on("error", (err) => {
+        while (waiters.length > 0) {
+            waiters.shift()!.reject(err);
+        }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+    });
+
+    socket.write(handshake);
+    await handshakePromise;
+
+    const receivedPeerId = receivedHandshake!.subarray(48, 68);
+    console.log(`Peer ID: ${receivedPeerId.toString("hex")}`);
+
+    // Check if the peer supports extensions (20th bit from right in reserved bytes)
+    const reserved = receivedHandshake!.subarray(20, 28);
+    const supportsExtensions = (reserved[5] & 0x10) !== 0;
+
+    if (supportsExtensions) {
+        // Wait for bitfield message (id 5)
+        let msg = await nextMessage();
+        while (msg[0] !== 5) {
+            msg = await nextMessage();
+        }
+
+        // Send extension handshake: {"m": {"ut_metadata": 1}}
+        const utMetadataId = 1;
+        const payload = Buffer.from(`d1:md11:ut_metadatai${utMetadataId}ee`, "ascii");
+        const extHandshake = Buffer.alloc(6 + payload.length);
+        extHandshake.writeUInt32BE(2 + payload.length, 0); // message length
+        extHandshake[4] = 20; // extended message id
+        extHandshake[5] = 0; // extension handshake id
+        payload.copy(extHandshake, 6);
+        socket.write(extHandshake);
+    }
+
+    socket.end();
 }
