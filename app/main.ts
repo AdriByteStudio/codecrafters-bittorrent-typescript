@@ -578,7 +578,7 @@ if (args[2] === "decode") {
 
         // Send extension handshake: {"m": {"ut_metadata": 1}}
         const utMetadataId = 1;
-        const payload = Buffer.from(`d1:md11:ut_metadatai${utMetadataId}ee`, "ascii");
+        const payload = Buffer.from(`d1:md11:ut_metadatai${utMetadataId}eee`, "ascii");
         const extHandshake = Buffer.alloc(6 + payload.length);
         extHandshake.writeUInt32BE(2 + payload.length, 0); // message length
         extHandshake[4] = 20; // extended message id
