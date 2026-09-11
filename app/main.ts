@@ -1,20 +1,26 @@
 // Examples:
 // - decodeBencode("5:hello") -> "hello"
 // - decodeBencode("10:hello12345") -> "hello12345"
-function decodeBencode(bencodedValue: string): string {
-    /* This function is used to decode a bencoded string
-    The bencoded string is a string that is prefixed by the length of the string
-    **/
-
-    // Check if the first character is a digit
+// - decodeBencode("i52e") -> 52
+// - decodeBencode("i-52e") -> -52
+function decodeBencode(bencodedValue: string): string | number {
+    // Check if the first character is a digit (bencoded string)
     if (!isNaN(parseInt(bencodedValue[0]))) {
         const firstColonIndex = bencodedValue.indexOf(":");
         if (firstColonIndex === -1) {
             throw new Error("Invalid encoded value");
         }
         return bencodedValue.substring(firstColonIndex + 1);
+    } else if (bencodedValue[0] === "i") {
+        // Bencoded integer: i<number>e
+        const endIndex = bencodedValue.indexOf("e", 1);
+        if (endIndex === -1) {
+            throw new Error("Invalid bencoded integer");
+        }
+        const integerStr = bencodedValue.substring(1, endIndex);
+        return parseInt(integerStr, 10);
     } else {
-        throw new Error("Only strings are supported at the moment");
+        throw new Error("Only strings and integers are supported at the moment");
     }
 }
 
