@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
-import { createHash } from "node:crypto";
+import * as net from "node:net";
+import { createHash, randomBytes } from "node:crypto";
 
 type BencodeValue = string | number | BencodeValue[] | { [key: string]: BencodeValue };
 
@@ -202,4 +203,39 @@ if (args[2] === "decode") {
             console.log(peer);
         }
     }
+} else if (args[2] === "handshake") {
+    const torrent = parseTorrent(args[3]);
+    const [peerHost, peerPortStr] = args[4].split(":");
+    const peerPort = parseInt(peerPortStr, 10);
+    const peerId = randomBytes(20);
+
+    // Build handshake: 1 + 19 + 8 + 20 + 20 = 68 bytes
+    const handshake = Buffer.alloc(68);
+    handshake[0] = 19; // protocol string length
+    handshake.write("BitTorrent protocol", 1); // protocol string (19 bytes)
+    // reserved bytes: 8 bytes of zeros (already zero from alloc)
+    torrent.infoHashRaw.copy(handshake, 28); // info hash (20 bytes)
+    peerId.copy(handshake, 48); // peer id (20 bytes)
+
+    const socket = net.createConnection(peerPort, peerHost);
+
+    await new Promise<void>((resolve, reject) => {
+        socket.on("connect", () => {
+            socket.write(handshake);
+        });
+
+        socket.on("data", (data: Buffer) => {
+            // The response handshake is 68 bytes
+            if (data.length >= 68) {
+                const receivedPeerId = data.subarray(48, 68);
+                console.log(`Peer ID: ${receivedPeerId.toString("hex")}`);
+            }
+            socket.end();
+            resolve();
+        });
+
+        socket.on("error", (err) => {
+            reject(err);
+        });
+    });
 }
