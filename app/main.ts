@@ -59,20 +59,15 @@ function decodeBencode(buffer: Buffer): BencodeValue {
     return decodeBencodeAt(buffer, { pos: 0 }).value;
 }
 
-const args = process.argv;
+interface TorrentInfo {
+    announce: string;
+    infoHashRaw: Buffer;
+    length: number;
+    pieceLength: number;
+    piecesRaw: Buffer | null;
+}
 
-if (args[2] === "decode") {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    console.error("Logs from your program will appear here!");
-
-    try {
-        const decoded = decodeBencode(Buffer.from(args[3], "utf8"));
-        console.log(JSON.stringify(decoded));
-    } catch (error) {
-        console.error(error.message);
-    }
-} else if (args[2] === "info") {
-    const filePath = args[3];
+function parseTorrent(filePath: string): TorrentInfo {
     const buffer = fs.readFileSync(filePath);
 
     // Walk the top-level dictionary, capturing the raw byte range of the `info` value.
@@ -94,9 +89,9 @@ if (args[2] === "decode") {
     }
 
     const infoBytes = buffer.subarray(infoStart, infoEnd);
-    const infoHash = createHash("sha1").update(infoBytes).digest("hex");
+    const infoHashRaw = createHash("sha1").update(infoBytes).digest();
 
-    // Walk the info dictionary to get raw byte ranges for pieces
+    // Walk the info dictionary to extract fields
     const infoCursor = { pos: 0 };
     infoCursor.pos++; // skip 'd'
     let length = 0;
@@ -111,21 +106,100 @@ if (args[2] === "decode") {
         } else if (key === "piece length") {
             pieceLength = valueResult.value as number;
         } else if (key === "pieces") {
-            // valueStart points to start of bencoded string (e.g., "92063:...")
-            // Find the colon to skip the length prefix and get raw binary data
             const colonIdx = infoBytes.indexOf(":".charCodeAt(0), valueStart);
             piecesRaw = infoBytes.subarray(colonIdx + 1, valueResult.endPos);
         }
     }
 
-    console.log(`Tracker URL: ${announce}`);
-    console.log(`Length: ${length}`);
-    console.log(`Info Hash: ${infoHash}`);
-    console.log(`Piece Length: ${pieceLength}`);
+    return { announce, infoHashRaw, length, pieceLength, piecesRaw };
+}
+
+function percentEncode(buf: Buffer): string {
+    let result = "";
+    for (const byte of buf) {
+        if (
+            (byte >= 0x41 && byte <= 0x5A) ||
+            (byte >= 0x61 && byte <= 0x7A) ||
+            (byte >= 0x30 && byte <= 0x39) ||
+            byte === 0x2D || byte === 0x5F || byte === 0x2E || byte === 0x7E
+        ) {
+            result += String.fromCharCode(byte);
+        } else {
+            result += "%" + byte.toString(16).toUpperCase().padStart(2, "0");
+        }
+    }
+    return result;
+}
+
+function parsePeers(peersRaw: Buffer): string[] {
+    const peers: string[] = [];
+    for (let i = 0; i < peersRaw.length; i += 6) {
+        const ip = `${peersRaw[i]}.${peersRaw[i + 1]}.${peersRaw[i + 2]}.${peersRaw[i + 3]}`;
+        const port = (peersRaw[i + 4] << 8) | peersRaw[i + 5];
+        peers.push(`${ip}:${port}`);
+    }
+    return peers;
+}
+
+const args = process.argv;
+
+if (args[2] === "decode") {
+    // You can use print statements as follows for debugging, they'll be visible when running tests.
+    console.error("Logs from your program will appear here!");
+
+    try {
+        const decoded = decodeBencode(Buffer.from(args[3], "utf8"));
+        console.log(JSON.stringify(decoded));
+    } catch (error) {
+        console.error(error.message);
+    }
+} else if (args[2] === "info") {
+    const torrent = parseTorrent(args[3]);
+    console.log(`Tracker URL: ${torrent.announce}`);
+    console.log(`Length: ${torrent.length}`);
+    console.log(`Info Hash: ${torrent.infoHashRaw.toString("hex")}`);
+    console.log(`Piece Length: ${torrent.pieceLength}`);
     console.log("Piece Hashes:");
-    if (piecesRaw) {
-        for (let i = 0; i < piecesRaw.length; i += 20) {
-            console.log(piecesRaw.subarray(i, i + 20).toString("hex"));
+    if (torrent.piecesRaw) {
+        for (let i = 0; i < torrent.piecesRaw.length; i += 20) {
+            console.log(torrent.piecesRaw.subarray(i, i + 20).toString("hex"));
+        }
+    }
+} else if (args[2] === "peers") {
+    const torrent = parseTorrent(args[3]);
+    const peerId = "-TS0001-123456789012";
+
+    const queryParams = [
+        `info_hash=${percentEncode(torrent.infoHashRaw)}`,
+        `peer_id=${encodeURIComponent(peerId)}`,
+        "port=6881",
+        "uploaded=0",
+        "downloaded=0",
+        `left=${torrent.length}`,
+        "compact=1",
+    ];
+    const trackerUrl = `${torrent.announce}?${queryParams.join("&")}`;
+
+    const response = await fetch(trackerUrl);
+    const responseBody = Buffer.from(await response.arrayBuffer());
+
+    // Walk the tracker response to get raw bytes of 'peers'
+    const cursor = { pos: 0 };
+    cursor.pos++; // skip 'd'
+    let peersRaw: Buffer | null = null;
+    while (responseBody[cursor.pos] !== "e".charCodeAt(0)) {
+        const key = decodeBencodeAt(responseBody, cursor).value as string;
+        const valueStart = cursor.pos;
+        const valueResult = decodeBencodeAt(responseBody, cursor);
+        if (key === "peers") {
+            const colonIdx = responseBody.indexOf(":".charCodeAt(0), valueStart);
+            peersRaw = responseBody.subarray(colonIdx + 1, valueResult.endPos);
+        }
+    }
+
+    if (peersRaw) {
+        for (const peer of parsePeers(peersRaw)) {
+            console.log(peer);
         }
     }
 }
