@@ -420,4 +420,45 @@ if (args[2] === "decode") {
 
     fs.writeFileSync(outputPath, pieceData);
     console.log(`Piece ${pieceIndex} downloaded to ${outputPath}`);
+} else if (args[2] === "download") {
+    const outputPath = args[4];
+    const torrentPath = args[5];
+
+    const torrent = parseTorrent(torrentPath);
+    const peers = await getPeersFromTracker(torrent);
+
+    const numPieces = Math.ceil(torrent.length / torrent.pieceLength);
+    const fileData = Buffer.alloc(torrent.length);
+
+    for (let pieceIndex = 0; pieceIndex < numPieces; pieceIndex++) {
+        let pieceData: Buffer | null = null;
+        for (const peer of peers) {
+            const [peerHost, peerPortStr] = peer.split(":");
+            const peerPort = parseInt(peerPortStr, 10);
+            try {
+                pieceData = await downloadPieceFromPeer(torrent, peerHost, peerPort, pieceIndex);
+                break;
+            } catch (err) {
+                // Try the next peer
+            }
+        }
+
+        if (!pieceData) {
+            throw new Error(`Failed to download piece ${pieceIndex} from any peer`);
+        }
+
+        // Verify the piece hash against the torrent file
+        if (torrent.piecesRaw) {
+            const expectedHash = torrent.piecesRaw.subarray(pieceIndex * 20, (pieceIndex + 1) * 20);
+            const actualHash = createHash("sha1").update(pieceData).digest();
+            if (!actualHash.equals(expectedHash)) {
+                throw new Error(`Piece ${pieceIndex} hash mismatch`);
+            }
+        }
+
+        pieceData.copy(fileData, pieceIndex * torrent.pieceLength);
+    }
+
+    fs.writeFileSync(outputPath, fileData);
+    console.log(`Downloaded ${torrentPath} to ${outputPath}`);
 }
