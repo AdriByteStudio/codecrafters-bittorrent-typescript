@@ -96,10 +96,36 @@ if (args[2] === "decode") {
     const infoBytes = buffer.subarray(infoStart, infoEnd);
     const infoHash = createHash("sha1").update(infoBytes).digest("hex");
 
-    const info = decodeBencode(infoBytes) as { [key: string]: BencodeValue };
-    const length = info["length"] as number;
+    // Walk the info dictionary to get raw byte ranges for pieces
+    const infoCursor = { pos: 0 };
+    infoCursor.pos++; // skip 'd'
+    let length = 0;
+    let pieceLength = 0;
+    let piecesRaw: Buffer | null = null;
+    while (infoBytes[infoCursor.pos] !== "e".charCodeAt(0)) {
+        const key = decodeBencodeAt(infoBytes, infoCursor).value as string;
+        const valueStart = infoCursor.pos;
+        const valueResult = decodeBencodeAt(infoBytes, infoCursor);
+        if (key === "length") {
+            length = valueResult.value as number;
+        } else if (key === "piece length") {
+            pieceLength = valueResult.value as number;
+        } else if (key === "pieces") {
+            // valueStart points to start of bencoded string (e.g., "92063:...")
+            // Find the colon to skip the length prefix and get raw binary data
+            const colonIdx = infoBytes.indexOf(":".charCodeAt(0), valueStart);
+            piecesRaw = infoBytes.subarray(colonIdx + 1, valueResult.endPos);
+        }
+    }
 
     console.log(`Tracker URL: ${announce}`);
     console.log(`Length: ${length}`);
     console.log(`Info Hash: ${infoHash}`);
+    console.log(`Piece Length: ${pieceLength}`);
+    console.log("Piece Hashes:");
+    if (piecesRaw) {
+        for (let i = 0; i < piecesRaw.length; i += 20) {
+            console.log(piecesRaw.subarray(i, i + 20).toString("hex"));
+        }
+    }
 }
