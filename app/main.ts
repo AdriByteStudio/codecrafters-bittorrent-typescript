@@ -1,9 +1,11 @@
 import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 
 type BencodeValue = string | number | BencodeValue[] | { [key: string]: BencodeValue };
 
 // Decodes a single bencoded value starting at cursor.pos, advancing the cursor past it.
-function decodeBencodeAt(buffer: Buffer, cursor: { pos: number }): BencodeValue {
+// Returns the decoded value and the position just after it.
+function decodeBencodeAt(buffer: Buffer, cursor: { pos: number }): { value: BencodeValue; endPos: number } {
     const firstChar = String.fromCharCode(buffer[cursor.pos]);
 
     if (!isNaN(parseInt(firstChar))) {
@@ -15,7 +17,7 @@ function decodeBencodeAt(buffer: Buffer, cursor: { pos: number }): BencodeValue 
         const length = parseInt(buffer.subarray(cursor.pos, colonIndex).toString("ascii"), 10);
         const start = colonIndex + 1;
         cursor.pos = start + length;
-        return buffer.subarray(start, cursor.pos).toString("utf8");
+        return { value: buffer.subarray(start, cursor.pos).toString("utf8"), endPos: cursor.pos };
     } else if (firstChar === "i") {
         // Bencoded integer: i<number>e
         const endIndex = buffer.indexOf("e".charCodeAt(0), cursor.pos + 1);
@@ -24,37 +26,37 @@ function decodeBencodeAt(buffer: Buffer, cursor: { pos: number }): BencodeValue 
         }
         const integerStr = buffer.subarray(cursor.pos + 1, endIndex).toString("ascii");
         cursor.pos = endIndex + 1;
-        return parseInt(integerStr, 10);
+        return { value: parseInt(integerStr, 10), endPos: cursor.pos };
     } else if (firstChar === "l") {
         // Bencoded list: l<bencoded_elements>e
         cursor.pos++; // skip 'l'
         const list: BencodeValue[] = [];
         while (buffer[cursor.pos] !== "e".charCodeAt(0)) {
-            list.push(decodeBencodeAt(buffer, cursor));
+            list.push(decodeBencodeAt(buffer, cursor).value);
         }
         cursor.pos++; // skip 'e'
-        return list;
+        return { value: list, endPos: cursor.pos };
     } else if (firstChar === "d") {
         // Bencoded dictionary: d<key1><value1>...<keyN><valueN>e
         cursor.pos++; // skip 'd'
         const dict: { [key: string]: BencodeValue } = {};
         while (buffer[cursor.pos] !== "e".charCodeAt(0)) {
-            const key = decodeBencodeAt(buffer, cursor);
+            const key = decodeBencodeAt(buffer, cursor).value;
             if (typeof key !== "string") {
                 throw new Error("Dictionary keys must be strings");
             }
-            const value = decodeBencodeAt(buffer, cursor);
+            const value = decodeBencodeAt(buffer, cursor).value;
             dict[key] = value;
         }
         cursor.pos++; // skip 'e'
-        return dict;
+        return { value: dict, endPos: cursor.pos };
     } else {
         throw new Error(`Invalid bencoded value: unexpected character '${firstChar}'`);
     }
 }
 
 function decodeBencode(buffer: Buffer): BencodeValue {
-    return decodeBencodeAt(buffer, { pos: 0 });
+    return decodeBencodeAt(buffer, { pos: 0 }).value;
 }
 
 const args = process.argv;
@@ -71,10 +73,33 @@ if (args[2] === "decode") {
     }
 } else if (args[2] === "info") {
     const filePath = args[3];
-    const decoded = decodeBencode(fs.readFileSync(filePath)) as { [key: string]: BencodeValue };
-    const announce = decoded["announce"] as string;
-    const info = decoded["info"] as { [key: string]: BencodeValue };
+    const buffer = fs.readFileSync(filePath);
+
+    // Walk the top-level dictionary, capturing the raw byte range of the `info` value.
+    const cursor = { pos: 0 };
+    cursor.pos++; // skip 'd'
+    let announce = "";
+    let infoStart = -1;
+    let infoEnd = -1;
+    while (buffer[cursor.pos] !== "e".charCodeAt(0)) {
+        const key = decodeBencodeAt(buffer, cursor).value as string;
+        const valueStart = cursor.pos;
+        const valueResult = decodeBencodeAt(buffer, cursor);
+        if (key === "announce") {
+            announce = valueResult.value as string;
+        } else if (key === "info") {
+            infoStart = valueStart;
+            infoEnd = valueResult.endPos;
+        }
+    }
+
+    const infoBytes = buffer.subarray(infoStart, infoEnd);
+    const infoHash = createHash("sha1").update(infoBytes).digest("hex");
+
+    const info = decodeBencode(infoBytes) as { [key: string]: BencodeValue };
     const length = info["length"] as number;
+
     console.log(`Tracker URL: ${announce}`);
     console.log(`Length: ${length}`);
+    console.log(`Info Hash: ${infoHash}`);
 }
