@@ -328,6 +328,225 @@ async function downloadPieceFromPeer(
     return pieceData;
 }
 
+interface PeerConnection {
+    socket: net.Socket;
+    nextMessage: () => Promise<Buffer>;
+}
+
+// Connects to a peer, performs the base handshake (with extension support)
+// and the extension handshake. Returns the open connection plus the
+// ut_metadata ids (ours and the peer's).
+async function connectToPeerWithExtensions(
+    peerHost: string,
+    peerPort: number,
+    infoHashRaw: Buffer
+): Promise<{ conn: PeerConnection; peerMetadataId: number; utMetadataId: number }> {
+    const peerId = randomBytes(20);
+    const handshake = buildHandshake(infoHashRaw, peerId, true);
+    const socket = net.createConnection(peerPort, peerHost);
+
+    const messageQueue: Buffer[] = [];
+    let waiters: { resolve: (msg: Buffer) => void; reject: (err: Error) => void }[] = [];
+
+    const pushMessage = (msg: Buffer) => {
+        if (waiters.length > 0) {
+            waiters.shift()!.resolve(msg);
+        } else {
+            messageQueue.push(msg);
+        }
+    };
+
+    const nextMessage = (): Promise<Buffer> => {
+        if (messageQueue.length > 0) {
+            return Promise.resolve(messageQueue.shift()!);
+        }
+        return new Promise((resolve, reject) => {
+            waiters.push({ resolve, reject });
+        });
+    };
+
+    let buffer = Buffer.alloc(0);
+    let handshakeReceived = false;
+    let resolveHandshake: () => void;
+    const handshakePromise = new Promise<void>((resolve) => {
+        resolveHandshake = resolve;
+    });
+
+    socket.on("data", (data: Buffer) => {
+        buffer = Buffer.concat([buffer, data]);
+
+        if (!handshakeReceived) {
+            if (buffer.length < 68) {
+                return;
+            }
+            buffer = buffer.subarray(68);
+            handshakeReceived = true;
+            resolveHandshake();
+        }
+
+        while (buffer.length >= 4) {
+            const length = buffer.readUInt32BE(0);
+            if (length === 0) {
+                buffer = buffer.subarray(4); // keep-alive
+                continue;
+            }
+            if (buffer.length < 4 + length) {
+                break; // incomplete message
+            }
+            const message = buffer.subarray(4, 4 + length);
+            buffer = buffer.subarray(4 + length);
+            pushMessage(message);
+        }
+    });
+
+    socket.on("error", (err) => {
+        while (waiters.length > 0) {
+            waiters.shift()!.reject(err);
+        }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+    });
+
+    socket.write(handshake);
+    await handshakePromise;
+
+    // Send extension handshake immediately (don't block on bitfield —
+    // some peers never send one). Then wait for the peer's extension
+    // handshake, ignoring any other messages (e.g. bitfield) in between.
+    const utMetadataId = 1;
+    const payload = Buffer.from(`d1:md11:ut_metadatai${utMetadataId}eee`, "ascii");
+    const extHandshake = Buffer.alloc(6 + payload.length);
+    extHandshake.writeUInt32BE(2 + payload.length, 0); // message length
+    extHandshake[4] = 20; // extended message id
+    extHandshake[5] = 0; // extension handshake id
+    payload.copy(extHandshake, 6);
+    socket.write(extHandshake);
+
+    let extMsg = await nextMessage();
+    while (extMsg[0] !== 20 || extMsg[1] !== 0) {
+        extMsg = await nextMessage();
+    }
+
+    const extDict = decodeBencode(extMsg.subarray(2)) as { [key: string]: BencodeValue };
+    const m = extDict["m"] as { [key: string]: BencodeValue };
+    const peerMetadataId = m["ut_metadata"] as number;
+
+    return { conn: { socket, nextMessage }, peerMetadataId, utMetadataId };
+}
+
+// Requests the (single-piece) metadata over an established extension
+// connection and returns the raw info-dict bytes, verified against infoHashRaw.
+async function fetchMetadataViaExtension(
+    conn: PeerConnection,
+    peerMetadataId: number,
+    utMetadataId: number,
+    infoHashRaw: Buffer
+): Promise<Buffer> {
+    const reqPayload = Buffer.from("d8:msg_typei0e5:piecei0ee", "ascii");
+    const metadataRequest = Buffer.alloc(6 + reqPayload.length);
+    metadataRequest.writeUInt32BE(2 + reqPayload.length, 0); // message length
+    metadataRequest[4] = 20; // extended message id
+    metadataRequest[5] = peerMetadataId; // peer's ut_metadata extension id
+    reqPayload.copy(metadataRequest, 6);
+    conn.socket.write(metadataRequest);
+
+    // The peer addresses extension messages to us using OUR advertised
+    // ut_metadata id (BEP 10: ids are interpreted in the receiver's id space).
+    let dataMsg = await conn.nextMessage();
+    while (dataMsg[0] !== 20 || dataMsg[1] !== utMetadataId) {
+        dataMsg = await conn.nextMessage();
+    }
+
+    // dataMsg = [msg_id=20][ext_id][bencoded dict][metadata bytes]
+    const cursor = { pos: 2 }; // skip msg_id and ext_id
+    decodeBencodeAt(Buffer.from(dataMsg), cursor);
+    const metadataBytes = Buffer.from(dataMsg.subarray(cursor.pos));
+
+    const computedHash = createHash("sha1").update(metadataBytes).digest();
+    if (!computedHash.equals(infoHashRaw)) {
+        throw new Error("Metadata hash mismatch");
+    }
+    return metadataBytes;
+}
+
+function parseInfoDict(infoBytes: Buffer): { length: number; pieceLength: number; piecesRaw: Buffer | null } {
+    const infoCursor = { pos: 0 };
+    infoCursor.pos++; // skip 'd'
+    let length = 0;
+    let pieceLength = 0;
+    let piecesRaw: Buffer | null = null;
+    while (infoBytes[infoCursor.pos] !== "e".charCodeAt(0)) {
+        const key = decodeBencodeAt(infoBytes, infoCursor).value as string;
+        const valueStart = infoCursor.pos;
+        const valueResult = decodeBencodeAt(infoBytes, infoCursor);
+        if (key === "length") {
+            length = valueResult.value as number;
+        } else if (key === "piece length") {
+            pieceLength = valueResult.value as number;
+        } else if (key === "pieces") {
+            const colonIdx = infoBytes.indexOf(":".charCodeAt(0), valueStart);
+            piecesRaw = infoBytes.subarray(colonIdx + 1, valueResult.endPos);
+        }
+    }
+    return { length, pieceLength, piecesRaw };
+}
+
+// Downloads a piece over an already-established peer connection
+// (sends interested, waits for unchoke, requests 16 KiB blocks).
+async function downloadPieceOnConnection(
+    conn: PeerConnection,
+    info: { length: number; pieceLength: number },
+    pieceIndex: number
+): Promise<Buffer> {
+    const interested = Buffer.alloc(5);
+    interested.writeUInt32BE(1, 0);
+    interested[4] = 2;
+    conn.socket.write(interested);
+
+    let msg = await conn.nextMessage();
+    while (msg[0] !== 1) {
+        msg = await conn.nextMessage();
+    }
+
+    const numPieces = Math.ceil(info.length / info.pieceLength);
+    const thisPieceLength =
+        pieceIndex === numPieces - 1
+            ? info.length - (numPieces - 1) * info.pieceLength
+            : info.pieceLength;
+
+    const blockSize = 16 * 1024; // 16 KiB
+    const numBlocks = Math.ceil(thisPieceLength / blockSize);
+    const pieceData = Buffer.alloc(thisPieceLength);
+    let blocksReceived = 0;
+
+    for (let begin = 0; begin < thisPieceLength; begin += blockSize) {
+        const blockLength = Math.min(blockSize, thisPieceLength - begin);
+        const request = Buffer.alloc(17);
+        request.writeUInt32BE(13, 0); // message length
+        request[4] = 6; // request id
+        request.writeUInt32BE(pieceIndex, 5); // index
+        request.writeUInt32BE(begin, 9); // begin
+        request.writeUInt32BE(blockLength, 13); // length
+        conn.socket.write(request);
+    }
+
+    while (blocksReceived < numBlocks) {
+        msg = await conn.nextMessage();
+        if (msg[0] !== 7) {
+            continue;
+        }
+        const begin = msg.readUInt32BE(5);
+        const block = msg.subarray(9);
+        block.copy(pieceData, begin);
+        blocksReceived++;
+    }
+
+    return pieceData;
+}
+
 const args = process.argv;
 
 if (args[2] === "decode") {
@@ -755,24 +974,7 @@ if (args[2] === "decode") {
     }
 
     // Parse the info dictionary from the metadata bytes
-    const infoCursor = { pos: 0 };
-    infoCursor.pos++; // skip 'd'
-    let length = 0;
-    let pieceLength = 0;
-    let piecesRaw: Buffer | null = null;
-    while (metadataBytes[infoCursor.pos] !== "e".charCodeAt(0)) {
-        const key = decodeBencodeAt(metadataBytes, infoCursor).value as string;
-        const valueStart = infoCursor.pos;
-        const valueResult = decodeBencodeAt(metadataBytes, infoCursor);
-        if (key === "length") {
-            length = valueResult.value as number;
-        } else if (key === "piece length") {
-            pieceLength = valueResult.value as number;
-        } else if (key === "pieces") {
-            const colonIdx = metadataBytes.indexOf(":".charCodeAt(0), valueStart);
-            piecesRaw = metadataBytes.subarray(colonIdx + 1, valueResult.endPos);
-        }
-    }
+    const { length, pieceLength, piecesRaw } = parseInfoDict(metadataBytes);
 
     console.log(`Tracker URL: ${trackerUrl}`);
     console.log(`Length: ${length}`);
@@ -786,5 +988,55 @@ if (args[2] === "decode") {
     }
 
     socket.destroy();
+    process.exit(0);
+} else if (args[2] === "magnet_download_piece") {
+    const outputPath = args[4];
+    const magnetLink = args[5];
+    const pieceIndex = parseInt(args[6], 10);
+
+    const query = magnetLink.split("?")[1];
+    const params = new URLSearchParams(query);
+    const xt = params.get("xt") ?? "";
+    const infoHashRaw = Buffer.from(xt.replace("urn:btih:", ""), "hex");
+    const trackerUrl = params.get("tr") ?? "";
+
+    const peers = await getPeersFromTracker(trackerUrl, infoHashRaw, 1);
+
+    let pieceData: Buffer | null = null;
+    for (const peer of peers) {
+        const [peerHost, peerPortStr] = peer.split(":");
+        const peerPort = parseInt(peerPortStr, 10);
+        try {
+            const { conn, peerMetadataId, utMetadataId } = await connectToPeerWithExtensions(
+                peerHost,
+                peerPort,
+                infoHashRaw
+            );
+            const metadataBytes = await fetchMetadataViaExtension(conn, peerMetadataId, utMetadataId, infoHashRaw);
+            const info = parseInfoDict(metadataBytes);
+            pieceData = await downloadPieceOnConnection(conn, info, pieceIndex);
+
+            // Verify the piece hash against the metadata
+            if (info.piecesRaw) {
+                const expectedHash = info.piecesRaw.subarray(pieceIndex * 20, (pieceIndex + 1) * 20);
+                const actualHash = createHash("sha1").update(pieceData).digest();
+                if (!actualHash.equals(expectedHash)) {
+                    throw new Error("Piece hash mismatch");
+                }
+            }
+
+            conn.socket.destroy();
+            break;
+        } catch (err) {
+            // Try the next peer
+        }
+    }
+
+    if (!pieceData) {
+        throw new Error("Failed to download piece from any peer");
+    }
+
+    fs.writeFileSync(outputPath, pieceData);
+    console.log(`Piece ${pieceIndex} downloaded to ${outputPath}`);
     process.exit(0);
 }
