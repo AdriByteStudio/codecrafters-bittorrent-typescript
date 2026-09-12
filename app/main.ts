@@ -1039,4 +1039,61 @@ if (args[2] === "decode") {
     fs.writeFileSync(outputPath, pieceData);
     console.log(`Piece ${pieceIndex} downloaded to ${outputPath}`);
     process.exit(0);
+} else if (args[2] === "magnet_download") {
+    const outputPath = args[4];
+    const magnetLink = args[5];
+
+    const query = magnetLink.split("?")[1];
+    const params = new URLSearchParams(query);
+    const xt = params.get("xt") ?? "";
+    const infoHashRaw = Buffer.from(xt.replace("urn:btih:", ""), "hex");
+    const trackerUrl = params.get("tr") ?? "";
+
+    const peers = await getPeersFromTracker(trackerUrl, infoHashRaw, 1);
+
+    let fileData: Buffer | null = null;
+    for (const peer of peers) {
+        const [peerHost, peerPortStr] = peer.split(":");
+        const peerPort = parseInt(peerPortStr, 10);
+        try {
+            const { conn, peerMetadataId, utMetadataId } = await connectToPeerWithExtensions(
+                peerHost,
+                peerPort,
+                infoHashRaw
+            );
+            const metadataBytes = await fetchMetadataViaExtension(conn, peerMetadataId, utMetadataId, infoHashRaw);
+            const info = parseInfoDict(metadataBytes);
+
+            const numPieces = Math.ceil(info.length / info.pieceLength);
+            fileData = Buffer.alloc(info.length);
+
+            for (let pieceIndex = 0; pieceIndex < numPieces; pieceIndex++) {
+                const pieceData = await downloadPieceOnConnection(conn, info, pieceIndex);
+
+                // Verify the piece hash against the metadata
+                if (info.piecesRaw) {
+                    const expectedHash = info.piecesRaw.subarray(pieceIndex * 20, (pieceIndex + 1) * 20);
+                    const actualHash = createHash("sha1").update(pieceData).digest();
+                    if (!actualHash.equals(expectedHash)) {
+                        throw new Error(`Piece ${pieceIndex} hash mismatch`);
+                    }
+                }
+
+                pieceData.copy(fileData, pieceIndex * info.pieceLength);
+            }
+
+            conn.socket.destroy();
+            break;
+        } catch (err) {
+            // Try the next peer
+        }
+    }
+
+    if (!fileData) {
+        throw new Error("Failed to download file from any peer");
+    }
+
+    fs.writeFileSync(outputPath, fileData);
+    console.log(`Downloaded ${magnetLink} to ${outputPath}`);
+    process.exit(0);
 }
