@@ -586,8 +586,19 @@ if (args[2] === "decode") {
         payload.copy(extHandshake, 6);
         socket.write(extHandshake);
 
-        // Give the message time to flush before closing
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        // Wait for the peer's extension handshake (msg id 20, ext id 0)
+        let extMsg = await nextMessage();
+        while (extMsg[0] !== 20 || extMsg[1] !== 0) {
+            extMsg = await nextMessage();
+        }
+
+        // Parse the bencoded payload: {"m": {"ut_metadata": <id>}}
+        // extMsg = [msg_id=20][ext_id=0][bencoded dict...], so skip 2 bytes
+        const extPayload = extMsg.subarray(2);
+        const extDict = decodeBencode(extPayload) as { [key: string]: BencodeValue };
+        const m = extDict["m"] as { [key: string]: BencodeValue };
+        const peerMetadataId = m["ut_metadata"] as number;
+        console.log(`Peer Metadata Extension ID: ${peerMetadataId}`);
     }
 
     socket.destroy();
