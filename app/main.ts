@@ -741,8 +741,54 @@ if (args[2] === "decode") {
     reqPayload.copy(metadataRequest, 6);
     socket.write(metadataRequest);
 
-    // Give the message time to flush before closing
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // Wait for the metadata data message (msg id 20, ext id = peer's ut_metadata id)
+    let dataMsg = await nextMessage();
+    while (dataMsg[0] !== 20 || dataMsg[1] !== peerMetadataId) {
+        dataMsg = await nextMessage();
+    }
+
+    // Payload = [msg_id=20][ext_id][bencoded dict][metadata bytes]
+    // Find the end of the bencoded dict to split dict from metadata
+    const cursor = { pos: 2 }; // skip msg_id and ext_id
+    decodeBencodeAt(Buffer.from(dataMsg), cursor);
+    const metadataBytes = Buffer.from(dataMsg.subarray(cursor.pos));
+
+    // Verify the metadata hash matches the info hash from the magnet link
+    const computedHash = createHash("sha1").update(metadataBytes).digest();
+    if (!computedHash.equals(infoHashRaw)) {
+        throw new Error("Metadata hash mismatch");
+    }
+
+    // Parse the info dictionary from the metadata bytes
+    const infoCursor = { pos: 0 };
+    infoCursor.pos++; // skip 'd'
+    let length = 0;
+    let pieceLength = 0;
+    let piecesRaw: Buffer | null = null;
+    while (metadataBytes[infoCursor.pos] !== "e".charCodeAt(0)) {
+        const key = decodeBencodeAt(metadataBytes, infoCursor).value as string;
+        const valueStart = infoCursor.pos;
+        const valueResult = decodeBencodeAt(metadataBytes, infoCursor);
+        if (key === "length") {
+            length = valueResult.value as number;
+        } else if (key === "piece length") {
+            pieceLength = valueResult.value as number;
+        } else if (key === "pieces") {
+            const colonIdx = metadataBytes.indexOf(":".charCodeAt(0), valueStart);
+            piecesRaw = metadataBytes.subarray(colonIdx + 1, valueResult.endPos);
+        }
+    }
+
+    console.log(`Tracker URL: ${trackerUrl}`);
+    console.log(`Length: ${length}`);
+    console.log(`Info Hash: ${infoHashRaw.toString("hex")}`);
+    console.log(`Piece Length: ${pieceLength}`);
+    console.log("Piece Hashes:");
+    if (piecesRaw) {
+        for (let i = 0; i < piecesRaw.length; i += 20) {
+            console.log(piecesRaw.subarray(i, i + 20).toString("hex"));
+        }
+    }
 
     socket.destroy();
     process.exit(0);
