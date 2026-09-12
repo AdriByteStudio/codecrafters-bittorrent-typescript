@@ -570,13 +570,9 @@ if (args[2] === "decode") {
     const supportsExtensions = (reserved[5] & 0x10) !== 0;
 
     if (supportsExtensions) {
-        // Wait for bitfield message (id 5)
-        let msg = await nextMessage();
-        while (msg[0] !== 5) {
-            msg = await nextMessage();
-        }
-
-        // Send extension handshake: {"m": {"ut_metadata": 1}}
+        // Send extension handshake immediately (don't block on bitfield —
+        // some peers never send one). Then wait for the peer's extension
+        // handshake, ignoring any other messages (e.g. bitfield) in between.
         const utMetadataId = 1;
         const payload = Buffer.from(`d1:md11:ut_metadatai${utMetadataId}eee`, "ascii");
         const extHandshake = Buffer.alloc(6 + payload.length);
@@ -704,13 +700,9 @@ if (args[2] === "decode") {
     socket.write(handshake);
     await handshakePromise;
 
-    // Wait for bitfield message (id 5)
-    let msg = await nextMessage();
-    while (msg[0] !== 5) {
-        msg = await nextMessage();
-    }
-
-    // Send extension handshake: {"m": {"ut_metadata": 1}}
+    // Send extension handshake immediately (don't block on bitfield —
+    // some peers never send one). Then wait for the peer's extension
+    // handshake, ignoring any other messages (e.g. bitfield) in between.
     const utMetadataId = 1;
     const payload = Buffer.from(`d1:md11:ut_metadatai${utMetadataId}eee`, "ascii");
     const extHandshake = Buffer.alloc(6 + payload.length);
