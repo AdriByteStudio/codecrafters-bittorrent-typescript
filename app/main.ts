@@ -733,9 +733,12 @@ if (args[2] === "decode") {
     reqPayload.copy(metadataRequest, 6);
     socket.write(metadataRequest);
 
-    // Wait for the metadata data message (msg id 20, ext id = peer's ut_metadata id)
+    // Wait for the metadata data message (msg id 20).
+    // NOTE: the peer addresses extension messages to us using OUR advertised
+    // ut_metadata id (BEP 10: ids are interpreted in the receiver's id space),
+    // so match on utMetadataId, not peerMetadataId.
     let dataMsg = await nextMessage();
-    while (dataMsg[0] !== 20 || dataMsg[1] !== peerMetadataId) {
+    while (dataMsg[0] !== 20 || dataMsg[1] !== utMetadataId) {
         dataMsg = await nextMessage();
     }
 
