@@ -331,6 +331,7 @@ async function downloadPieceFromPeer(
 interface PeerConnection {
     socket: net.Socket;
     nextMessage: () => Promise<Buffer>;
+    isUnchoked: () => boolean;
 }
 
 // Connects to a peer, performs the base handshake (with extension support)
@@ -347,8 +348,12 @@ async function connectToPeerWithExtensions(
 
     const messageQueue: Buffer[] = [];
     let waiters: { resolve: (msg: Buffer) => void; reject: (err: Error) => void }[] = [];
+    let unchoked = false;
 
     const pushMessage = (msg: Buffer) => {
+        if (msg[0] === 1) {
+            unchoked = true; // remember unchoke even if nobody is waiting yet
+        }
         if (waiters.length > 0) {
             waiters.shift()!.resolve(msg);
         } else {
@@ -364,6 +369,8 @@ async function connectToPeerWithExtensions(
             waiters.push({ resolve, reject });
         });
     };
+
+    const isUnchoked = () => unchoked;
 
     let buffer = Buffer.alloc(0);
     let handshakeReceived = false;
@@ -434,7 +441,7 @@ async function connectToPeerWithExtensions(
     const m = extDict["m"] as { [key: string]: BencodeValue };
     const peerMetadataId = m["ut_metadata"] as number;
 
-    return { conn: { socket, nextMessage }, peerMetadataId, utMetadataId };
+    return { conn: { socket, nextMessage, isUnchoked }, peerMetadataId, utMetadataId };
 }
 
 // Requests the (single-piece) metadata over an established extension
@@ -506,9 +513,13 @@ async function downloadPieceOnConnection(
     interested[4] = 2;
     conn.socket.write(interested);
 
-    let msg = await conn.nextMessage();
-    while (msg[0] !== 1) {
-        msg = await conn.nextMessage();
+    // Wait for unchoke unless we've already been unchoked (an unchoke
+    // arriving before we asked would otherwise be missed forever).
+    if (!conn.isUnchoked()) {
+        let msg = await conn.nextMessage();
+        while (msg[0] !== 1) {
+            msg = await conn.nextMessage();
+        }
     }
 
     const numPieces = Math.ceil(info.length / info.pieceLength);
@@ -534,12 +545,12 @@ async function downloadPieceOnConnection(
     }
 
     while (blocksReceived < numBlocks) {
-        msg = await conn.nextMessage();
-        if (msg[0] !== 7) {
+        const pieceMsg = await conn.nextMessage();
+        if (pieceMsg[0] !== 7) {
             continue;
         }
-        const begin = msg.readUInt32BE(5);
-        const block = msg.subarray(9);
+        const begin = pieceMsg.readUInt32BE(5);
+        const block = pieceMsg.subarray(9);
         block.copy(pieceData, begin);
         blocksReceived++;
     }
